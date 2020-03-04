@@ -2,116 +2,39 @@ package main
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
-	"flag"
+	"crypto/rand"
 	"fmt"
+	mrand "math/rand"
 	"os"
 	"os/signal"
 	"sync"
 	"time"
 
 	"github.com/ipfs/go-datastore"
-	"github.com/ipfs/go-ds-badger"
+	badger "github.com/ipfs/go-ds-badger"
+	b58 "github.com/mr-tron/base58/base58"
+
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
-	"github.com/libp2p/go-libp2p-core/peerstore"
-	"github.com/libp2p/go-libp2p-core/test"
-	"github.com/libp2p/go-libp2p-kad-dht"
+
+	dht "github.com/libp2p/go-libp2p-kad-dht"
+	kbucket "github.com/libp2p/go-libp2p-kbucket"
 	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
 	"github.com/multiformats/go-multiaddr"
+	mh "github.com/multiformats/go-multihash"
+	"github.com/opentracing/opentracing-go/log"
 
-	_ "github.com/mattn/go-sqlite3"
 	_ "github.com/multiformats/go-multiaddr-dns"
 )
 
-const WORKERS = 8
+const WORKERS = 10
 
-var (
-	dumpFlg = flag.String("dump", "", "dumps database to an ndjson file")
-	update  = flag.Bool("update", false, "update existing peers")
-)
-
-const createSql = `
-	CREATE TABLE IF NOT EXISTS peers
-	(
-		id    TEXT NOT NULL PRIMARY KEY,
-		agent TEXT NOT NULL,
-		proto TEXT NOT NULL
-	);
-	
-	CREATE TABLE IF NOT EXISTS addrs
-	(
-		peer_id TEXT NOT NULL,
-		addr    TEXT NOT NULL,
-		FOREIGN KEY (peer_id) REFERENCES peers (id)
-	);
-	
-	CREATE TABLE IF NOT EXISTS protocols
-	(
-		peer_id  TEXT NOT NULL,
-		protocol TEXT NOT NULL,
-		FOREIGN KEY (peer_id) REFERENCES peers (id)
-	);
-	
-	CREATE INDEX IF NOT EXISTS protocol ON protocols (protocol);
-	CREATE INDEX IF NOT EXISTS addr ON addrs (addr);
-	`
-
-type logOutput struct {
-	Id       string
-	Agent    string
-	Protocol string
-	Addrs    []string
-	Protos   []string
-}
-
-func (l *logOutput) reset() {
-	l.Id = ""
-	l.Agent = ""
-	l.Protocol = ""
-	l.Addrs = l.Addrs[0:0]
-	l.Protos = l.Protos[0:0]
-}
-
-type statement struct {
-	sql  string
-	stmt *sql.Stmt
-}
-
-var statements = struct {
-	GetPeer      *statement
-	UpsertPeer   *statement
-	DeleteAddrs  *statement
-	AddAddr      *statement
-	DeleteProtos *statement
-	AddProtos    *statement
-}{
-	GetPeer: &statement{
-		sql: `
-			SELECT count(id) FROM peers where id = ?;
-		`,
-	},
-	UpsertPeer: &statement{
-		sql: `
-			INSERT INTO peers(id, agent, proto) VALUES (?, ?, ?) 
-			ON CONFLICT(id) DO UPDATE SET agent = excluded.agent, proto = excluded.proto;
-		`,
-	},
-	DeleteAddrs: &statement{
-		sql: "DELETE FROM addrs WHERE peer_id = ?;",
-	},
-	DeleteProtos: &statement{
-		sql: "DELETE FROM protocols WHERE peer_id = ?;",
-	},
-	AddAddr: &statement{
-		sql: "INSERT INTO addrs(peer_id, addr) VALUES (?, ?)",
-	},
-	AddProtos: &statement{
-		sql: "INSERT INTO protocols(peer_id, protocol) VALUES (?, ?)",
-	},
+type NodeStat struct {
+	seen      time.Time
+	connected time.Time
+	// other info can be taken from the peerstore
 }
 
 type Crawler struct {
@@ -121,62 +44,54 @@ type Crawler struct {
 	id   *identify.IDService
 
 	mu sync.Mutex
-	db *sql.DB
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	limiter <-chan time.Time
+
+	nodes map[peer.ID]*NodeStat
+
+	qlog    *os.File
+	connlog *os.File
 }
 
 type notifee Crawler
 
-var _ network.Notifiee = (*notifee)(nil)
+var _ network.Notifiee = (*Crawler)(nil)
 
 func NewCrawler() *Crawler {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	c := &Crawler{
-		ctx:    ctx,
-		cancel: cancel,
+		ctx:     ctx,
+		cancel:  cancel,
+		nodes:   make(map[peer.ID]*NodeStat),
+		limiter: time.Tick(2000 * time.Millisecond),
 	}
 
-	c.initDB()
+	qlog, err := os.OpenFile("random_queries.log", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	if err != nil {
+		fmt.Println("Can't open query log file")
+		panic(err)
+	}
+	c.qlog = qlog
+
+	connlog, err := os.OpenFile("conn.log", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	if err != nil {
+		fmt.Println("Can't open connection log file")
+		panic(err)
+	}
+
+	c.connlog = connlog
 	c.initHost()
 	return c
 }
 
-func (c *Crawler) initDB() {
-	var err error
-	db, err := sql.Open("sqlite3", "file:peers.db")
-	if err != nil {
-		panic(err)
-	}
-
-	_, err = db.Exec(createSql)
-	if err != nil {
-		panic(err)
-	}
-	c.db = db
-
-	stmts := []*statement{
-		statements.GetPeer,
-		statements.UpsertPeer,
-		statements.DeleteAddrs,
-		statements.DeleteProtos,
-		statements.AddAddr,
-		statements.AddProtos,
-	}
-
-	for _, s := range stmts {
-		if s.stmt, err = db.Prepare(s.sql); err != nil {
-			panic(err)
-		}
-	}
-}
-
 func (c *Crawler) initHost() {
 	var err error
-	c.host, err = libp2p.New(context.Background())
+
+	c.host, err = libp2p.New(c.ctx)
 	if err != nil {
 		panic(err)
 	}
@@ -204,14 +119,21 @@ func (c *Crawler) initHost() {
 }
 
 func (c *Crawler) close() {
-	c.cancel()
+	//c.cancel()
+	fmt.Println("Shutting down the crawler")
 	c.wg.Done()
 
-	if err := c.db.Close(); err != nil {
-		fmt.Printf("error while shutting down: %v\n", err)
+	if err := c.qlog.Close(); err != nil {
+		fmt.Printf("error while closing query log: %v\n", err)
+	}
+	if err := c.connlog.Close(); err != nil {
+		fmt.Printf("error while connection log: %v\n", err)
 	}
 	if err := c.ds.Close(); err != nil {
 		fmt.Printf("error while shutting down: %v\n", err)
+	}
+	if err := c.host.Close(); err != nil {
+		fmt.Printf("error closing connection from host: %v\n", err)
 	}
 }
 
@@ -223,151 +145,121 @@ func (c *Crawler) start() {
 
 	go c.reporter()
 
-	c.host.Network().Notify((*notifee)(c))
+	c.host.Network().Notify(c)
+}
+
+func (c *Crawler) LogNewPeer(id peer.ID) *NodeStat {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	stats, ok := c.nodes[id]
+	if !ok {
+		fmt.Printf("Got new peer %v\n", id.Pretty())
+
+		c.nodes[id] = &NodeStat{
+			seen: time.Now(),
+		}
+	} else {
+		stats.seen = time.Now()
+	}
+	return c.nodes[id]
+}
+
+func commonPrefix(key string, id peer.ID) int {
+	id1 := kbucket.ConvertKey(key)
+	id2 := kbucket.ConvertPeerID(id)
+
+	return kbucket.CommonPrefixLen(id1, id2)
 }
 
 func (c *Crawler) worker() {
-Work:
-	id, err := test.RandPeerID()
+	for {
+		<-c.limiter
+		randomKey, logKey := getRandomKey()
+		fmt.Printf("Querying a random key\n")
+		//fmt.Printf("Getting closest peers to: %s\n", randomKey)
+		wctx, cancel := context.WithTimeout(c.ctx, 120*time.Second)
+		//_, _ = c.dht.FindPeer(ctx, id) // new peers will be saved in the peer store
+		peers, err := c.dht.GetClosestPeers(wctx, randomKey)
+		if err != nil {
+			log.Error(err)
+			cancel()
+		}
+
+		done := false
+		clenmax := 0
+		for !done {
+			select {
+			case pid, ok := <-peers:
+				if !ok {
+					done = true
+					break
+				}
+				clen := commonPrefix(randomKey, pid)
+				fmt.Fprintf(c.qlog, "%d,%s,%s,%d,%d\n", time.Now().Unix(), pid.Pretty(), logKey, clen, (1 << clen))
+
+				if clen > clenmax {
+					fmt.Printf("Found common prefix of length %d, estimated node count %d\n", clen, (1 << clen))
+					clenmax = clen
+				}
+
+			case <-wctx.Done():
+				done = true
+			}
+		}
+
+		// make a random delay between queries
+		time.Sleep(time.Duration(1000+mrand.Intn(500)) * time.Millisecond)
+		cancel()
+	}
+
+}
+
+func getRandomKey() (string, string) {
+	buf := make([]byte, 32)
+	rand.Read(buf)
+	o, err := mh.Encode(buf, mh.SHA2_256)
 	if err != nil {
 		panic(err)
 	}
-	// fmt.Printf("looking for peer: %s\n", id)
-	ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
-	_, _ = c.dht.FindPeer(ctx, id)
-	cancel()
-	goto Work
+	return string(o), b58.Encode(o)
 }
 
 func (c *Crawler) reporter() {
-	var (
-		count int
-		row   *sql.Row
-		err   error
-	)
 
 	for {
 		select {
 		case <-time.After(10 * time.Second):
-			row = c.db.QueryRow("SELECT COUNT(id) FROM peers")
-			if err = row.Scan(&count); err != nil {
-				panic(err)
-			}
-			fmt.Printf("--- found %d peers\n", count)
+			fmt.Printf("--- found %d peers\n", len(c.nodes))
 		case <-c.ctx.Done():
 			return
 		}
 	}
 }
 
-func (n *notifee) Connected(net network.Network, conn network.Conn) {
+func (n *Crawler) Connected(net network.Network, conn network.Conn) {
 	p := conn.RemotePeer()
-	pstore := net.Peerstore()
-
 	go func() {
 		n.id.IdentifyConn(conn)
 		<-n.id.IdentifyWait(conn)
 
-		protos, err := pstore.GetProtocols(p)
-		if err != nil {
-			panic(err)
-		}
+		stats := n.LogNewPeer(p)
+		stats.connected = time.Now()
+		fmt.Fprintf(n.connlog, "%d,%s\n", time.Now().Unix(), p.Pretty())
 
-		addrs := pstore.Addrs(p)
-
-		agent, err := pstore.Get(p, "AgentVersion")
-		switch err {
-		case nil:
-		case peerstore.ErrNotFound:
-			agent = ""
-		default:
-			panic(err)
-		}
-
-		protocol, err := pstore.Get(p, "ProtocolVersion")
-		switch err {
-		case nil:
-		case peerstore.ErrNotFound:
-			protocol = ""
-		default:
-			panic(err)
-		}
-
-		line := logOutput{
-			Id:       p.Pretty(),
-			Agent:    agent.(string),
-			Protocol: protocol.(string),
-			Addrs: func() (ret []string) {
-				for _, a := range addrs {
-					ret = append(ret, a.String())
-				}
-				return ret
-			}(),
-			Protos: protos,
-		}
-
-		j, err := json.Marshal(line)
-		if err != nil {
-			panic(err)
-		}
-
-		fmt.Println(string(j))
-
-		if !*update {
-			var cnt int
-			row := statements.GetPeer.stmt.QueryRow(p.Pretty())
-			if err := row.Scan(&cnt); err != nil {
-				panic(err)
-			}
-			if cnt > 0 {
-				fmt.Println("(duplicate peer; skipping)")
-				return
-			}
-		}
-
-		n.mu.Lock()
-		defer n.mu.Unlock()
-
-		if _, err = statements.UpsertPeer.stmt.Exec(p.Pretty(), agent, protocol); err != nil {
-			panic(err)
-		}
-		if _, err = statements.DeleteAddrs.stmt.Exec(p.Pretty()); err != nil {
-			panic(err)
-		}
-		for _, addr := range addrs {
-			if _, err = statements.AddAddr.stmt.Exec(p.Pretty(), addr.String()); err != nil {
-				panic(err)
-			}
-		}
-		if _, err = statements.DeleteProtos.stmt.Exec(p.Pretty()); err != nil {
-			panic(err)
-		}
-		for _, proto := range protos {
-			if _, err = statements.AddProtos.stmt.Exec(p.Pretty(), proto); err != nil {
-				panic(err)
-			}
-		}
 	}()
 }
 
-func (*notifee) Listen(network.Network, multiaddr.Multiaddr)      {}
-func (*notifee) ListenClose(network.Network, multiaddr.Multiaddr) {}
-func (*notifee) Disconnected(network.Network, network.Conn)       {}
-func (*notifee) OpenedStream(network.Network, network.Stream)     {}
-func (*notifee) ClosedStream(network.Network, network.Stream)     {}
+func (*Crawler) Listen(network.Network, multiaddr.Multiaddr)      {}
+func (*Crawler) ListenClose(network.Network, multiaddr.Multiaddr) {}
+func (*Crawler) Disconnected(network.Network, network.Conn)       {}
+func (*Crawler) OpenedStream(network.Network, network.Stream)     {}
+func (*Crawler) ClosedStream(network.Network, network.Stream)     {}
 
 func main() {
 
-	flag.Parse()
-
 	c := NewCrawler()
-
-	if *dumpFlg != "" {
-		fmt.Println("dumping")
-		dump(c.db, *dumpFlg)
-		return
-	}
-
+	defer c.close()
 	c.start()
 
 	ch := make(chan os.Signal, 1)
@@ -377,67 +269,5 @@ func main() {
 	case <-ch:
 		c.close()
 		return
-	case <-c.ctx.Done():
-		return
 	}
-}
-
-func dump(db *sql.DB, filename string) {
-	var obj logOutput
-	var str string
-
-	out, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
-	if err != nil {
-		panic(err)
-	}
-	defer out.Close()
-
-	rows, err := db.Query("select * from peers")
-	if err != nil {
-		panic(err)
-	}
-
-	for rows.Next() {
-		obj.reset()
-
-		if err := rows.Scan(&obj.Id, &obj.Agent, &obj.Protocol); err != nil {
-			panic(err)
-		}
-
-		addrRows, err := db.Query("select addr from main.addrs where peer_id = ?", obj.Id)
-		if err != nil {
-			return
-		}
-		for addrRows.Next() {
-			if err := addrRows.Scan(&str); err != nil {
-				panic(err)
-			}
-			obj.Addrs = append(obj.Addrs, str)
-		}
-
-		protoRows, err := db.Query("select protocol from main.protocols where peer_id = ?", obj.Id)
-		if err != nil {
-			panic(err)
-		}
-		for protoRows.Next() {
-			if err := protoRows.Scan(&str); err != nil {
-				panic(err)
-			}
-			obj.Protos = append(obj.Protos, str)
-		}
-
-		j, err := json.Marshal(&obj)
-		if err != nil {
-			panic(err)
-		}
-
-		if _, err = out.WriteString(string(j)); err != nil {
-			panic(err)
-		}
-
-		if _, err = out.WriteString("\n"); err != nil {
-			panic(err)
-		}
-	}
-
 }
