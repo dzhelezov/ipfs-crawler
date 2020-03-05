@@ -43,14 +43,10 @@ type Crawler struct {
 	ds   datastore.Batching
 	id   *identify.IDService
 
-	mu sync.Mutex
-
 	ctx     context.Context
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	limiter <-chan time.Time
-
-	nodes map[peer.ID]*NodeStat
 
 	qlog    *os.File
 	connlog *os.File
@@ -59,6 +55,8 @@ type Crawler struct {
 type notifee Crawler
 
 var _ network.Notifiee = (*Crawler)(nil)
+var mu sync.Mutex
+var nodes map[peer.ID]*NodeStat = make(map[peer.ID]*NodeStat)
 
 func NewCrawler() *Crawler {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -66,8 +64,7 @@ func NewCrawler() *Crawler {
 	c := &Crawler{
 		ctx:     ctx,
 		cancel:  cancel,
-		nodes:   make(map[peer.ID]*NodeStat),
-		limiter: time.Tick(2000 * time.Millisecond),
+		limiter: time.Tick(5000 * time.Millisecond),
 	}
 
 	qlog, err := os.OpenFile("random_queries.log", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
@@ -119,9 +116,11 @@ func (c *Crawler) initHost() {
 }
 
 func (c *Crawler) close() {
-	//c.cancel()
+
 	fmt.Println("Shutting down the crawler")
-	c.wg.Done()
+	c.cancel()
+	// wait until all the workers finish the queries
+	c.wg.Wait()
 
 	if err := c.qlog.Close(); err != nil {
 		fmt.Printf("error while closing query log: %v\n", err)
@@ -138,31 +137,31 @@ func (c *Crawler) close() {
 }
 
 func (c *Crawler) start() {
+	fmt.Printf("Starting a new crawler with %d workers\n", WORKERS)
+
 	for i := 0; i < WORKERS; i++ {
 		c.wg.Add(1)
 		go c.worker()
 	}
 
-	go c.reporter()
-
 	c.host.Network().Notify(c)
 }
 
-func (c *Crawler) LogNewPeer(id peer.ID) *NodeStat {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func LogNewPeer(id peer.ID) *NodeStat {
+	mu.Lock()
+	defer mu.Unlock()
 
-	stats, ok := c.nodes[id]
+	stats, ok := nodes[id]
 	if !ok {
 		fmt.Printf("Got new peer %v\n", id.Pretty())
 
-		c.nodes[id] = &NodeStat{
+		nodes[id] = &NodeStat{
 			seen: time.Now(),
 		}
 	} else {
 		stats.seen = time.Now()
 	}
-	return c.nodes[id]
+	return nodes[id]
 }
 
 func commonPrefix(key string, id peer.ID) int {
@@ -174,45 +173,49 @@ func commonPrefix(key string, id peer.ID) int {
 
 func (c *Crawler) worker() {
 	for {
-		<-c.limiter
-		randomKey, logKey := getRandomKey()
-		fmt.Printf("Querying a random key\n")
-		//fmt.Printf("Getting closest peers to: %s\n", randomKey)
-		wctx, cancel := context.WithTimeout(c.ctx, 120*time.Second)
-		//_, _ = c.dht.FindPeer(ctx, id) // new peers will be saved in the peer store
-		peers, err := c.dht.GetClosestPeers(wctx, randomKey)
-		if err != nil {
-			log.Error(err)
-			cancel()
-		}
-
-		done := false
-		clenmax := 0
-		for !done {
-			select {
-			case pid, ok := <-peers:
-				if !ok {
-					done = true
-					break
-				}
-				clen := commonPrefix(randomKey, pid)
-				fmt.Fprintf(c.qlog, "%d,%s,%s,%d,%d\n", time.Now().Unix(), pid.Pretty(), logKey, clen, (1 << clen))
-
-				if clen > clenmax {
-					fmt.Printf("Found common prefix of length %d, estimated node count %d\n", clen, (1 << clen))
-					clenmax = clen
-				}
-
-			case <-wctx.Done():
-				done = true
+		select {
+		case <-c.ctx.Done():
+			c.wg.Done()
+			fmt.Printf("The crawler is done, stopping the worker\n")
+			return
+		default:
+			<-c.limiter
+			randomKey, logKey := getRandomKey()
+			fmt.Printf("Querying a random key\n")
+			qctx, qcancel := context.WithTimeout(c.ctx, 120*time.Second)
+			peers, err := c.dht.GetClosestPeers(qctx, randomKey)
+			if err != nil {
+				log.Error(err)
+				qcancel()
 			}
+
+			done := false
+			clenmax := 0
+			for !done {
+				select {
+				case pid, ok := <-peers:
+					if !ok {
+						done = true
+						break
+					}
+					clen := commonPrefix(randomKey, pid)
+					fmt.Fprintf(c.qlog, "%d,%s,%s,%d,%d\n", time.Now().Unix(), pid.Pretty(), logKey, clen, (1 << clen))
+
+					if clen > clenmax {
+						fmt.Printf("Found common prefix of length %d, estimated node count %d\n", clen, (1 << clen))
+						clenmax = clen
+					}
+
+				case <-qctx.Done():
+					done = true
+				}
+			}
+
+			qcancel()
+			// make a random delay between queries
+			time.Sleep(time.Duration(1000+mrand.Intn(500)) * time.Millisecond)
 		}
-
-		// make a random delay between queries
-		time.Sleep(time.Duration(1000+mrand.Intn(500)) * time.Millisecond)
-		cancel()
 	}
-
 }
 
 func getRandomKey() (string, string) {
@@ -225,15 +228,12 @@ func getRandomKey() (string, string) {
 	return string(o), b58.Encode(o)
 }
 
-func (c *Crawler) reporter() {
+func report() {
 
 	for {
-		select {
-		case <-time.After(10 * time.Second):
-			fmt.Printf("--- found %d peers\n", len(c.nodes))
-		case <-c.ctx.Done():
-			return
-		}
+		<-time.After(10 * time.Second)
+		fmt.Printf("====== scraped %d peers in total ====== \n", len(nodes))
+		// more stats can be logged here
 	}
 }
 
@@ -243,7 +243,7 @@ func (n *Crawler) Connected(net network.Network, conn network.Conn) {
 		n.id.IdentifyConn(conn)
 		<-n.id.IdentifyWait(conn)
 
-		stats := n.LogNewPeer(p)
+		stats := LogNewPeer(p)
 		stats.connected = time.Now()
 		fmt.Fprintf(n.connlog, "%d,%s\n", time.Now().Unix(), p.Pretty())
 
@@ -258,16 +258,24 @@ func (*Crawler) ClosedStream(network.Network, network.Stream)     {}
 
 func main() {
 
-	c := NewCrawler()
-	defer c.close()
-	c.start()
-
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, os.Interrupt, os.Kill)
 
-	select {
-	case <-ch:
-		c.close()
-		return
+	go report()
+
+	for {
+
+		c := NewCrawler()
+		c.start()
+
+		select {
+		case <-time.After(1 * time.Hour):
+			// start afresh every 1 hour to prefent the address book saturation
+			c.close()
+		case <-ch:
+			fmt.Printf("Process interrupted, shutting down...")
+			return
+		}
 	}
+
 }
