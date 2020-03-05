@@ -6,6 +6,8 @@ the network size and the churn.
 
 By averaging the maximal common length prefix of peers ID with random key shots, one can ballpark (up to say 2x) the network size. Counting the connections gives a more accurate estimate but it takes around 20-30 minutes to saturate. 
 
+Some basic R data analysis is present in `logs-analysis.R`
+
 ## License
 
 Authored by raulk. Dual-licensed under MIT and ASLv2, by way of the [Permissive License Stack](https://protocol.ai/blog/announcing-the-permissive-license-stack/).
