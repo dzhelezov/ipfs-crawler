@@ -277,8 +277,8 @@ func main() {
 		c.start()
 
 		select {
-		case <-time.After(10 * time.Second):
-			// start afresh every 1 hour to prefent the address book saturation
+		case <-time.After(30 * time.Minute):
+			// start afresh every 30 Minutes to prefent the address book saturation
 			c.close()
 			// GC'ing
 			c=nil
