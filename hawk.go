@@ -239,15 +239,22 @@ func report() {
 }
 
 func (n *Crawler) Connected(net network.Network, conn network.Conn) {
-	p := conn.RemotePeer()
 	go func() {
-		n.id.IdentifyConn(conn)
-		<-n.id.IdentifyWait(conn)
+		n.wg.Add(1)
+		defer n.wg.Done()
 
-		stats := LogNewPeer(p)
-		stats.connected = time.Now()
-		fmt.Fprintf(n.connlog, "%d,%s\n", time.Now().Unix(), p.Pretty())
+		select {
+		case <-n.ctx.Done():
+			return
+		default:	
+			p := conn.RemotePeer()
+			n.id.IdentifyConn(conn)
+			<-n.id.IdentifyWait(conn)
 
+			stats := LogNewPeer(p)
+			stats.connected = time.Now()
+			fmt.Fprintf(n.connlog, "%d,%s\n", time.Now().Unix(), p.Pretty())
+		}	
 	}()
 }
 
@@ -270,9 +277,11 @@ func main() {
 		c.start()
 
 		select {
-		case <-time.After(1 * time.Hour):
+		case <-time.After(10 * time.Second):
 			// start afresh every 1 hour to prefent the address book saturation
 			c.close()
+			// GC'ing
+			c=nil
 		case <-ch:
 			fmt.Printf("Process interrupted, shutting down...")
 			return
