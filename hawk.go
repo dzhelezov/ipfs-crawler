@@ -69,14 +69,14 @@ func NewCrawler() *Crawler {
 
 	qlog, err := os.OpenFile("random_queries.log", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
 	if err != nil {
-		fmt.Println("Can't open query log file")
+		fmt.Println("Can't open the query log file")
 		panic(err)
 	}
 	c.qlog = qlog
 
 	connlog, err := os.OpenFile("conn.log", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
 	if err != nil {
-		fmt.Println("Can't open connection log file")
+		fmt.Println("Can't open the connection log file")
 		panic(err)
 	}
 
@@ -123,10 +123,10 @@ func (c *Crawler) close() {
 	c.wg.Wait()
 
 	if err := c.qlog.Close(); err != nil {
-		fmt.Printf("error while closing query log: %v\n", err)
+		fmt.Printf("error while closing the query log: %v\n", err)
 	}
 	if err := c.connlog.Close(); err != nil {
-		fmt.Printf("error while connection log: %v\n", err)
+		fmt.Printf("error while closing the connection log: %v\n", err)
 	}
 	if err := c.ds.Close(); err != nil {
 		fmt.Printf("error while shutting down: %v\n", err)
@@ -172,10 +172,10 @@ func commonPrefix(key string, id peer.ID) int {
 }
 
 func (c *Crawler) worker() {
+	defer c.wg.Done()
 	for {
 		select {
 		case <-c.ctx.Done():
-			c.wg.Done()
 			fmt.Printf("The crawler is done, stopping the worker\n")
 			return
 		default:
@@ -232,6 +232,7 @@ func report() {
 
 	for {
 		<-time.After(10 * time.Second)
+		// an unsynced call is safe here as we just log approx size
 		fmt.Printf("====== scraped %d peers in total ====== \n", len(nodes))
 		// more stats can be logged here
 	}
